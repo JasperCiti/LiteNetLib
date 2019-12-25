@@ -54,12 +54,14 @@ namespace LiteNetLib
             Error,
             ConnectionLatencyUpdated,
             Broadcast,
-            ConnectionRequest
+            ConnectionRequest,
+            MessageDelivered
         }
         public EType Type;
 
         public NetPeer Peer;
         public IPEndPoint RemoteEndPoint;
+        public object UserData;
         public int Latency;
         public SocketError ErrorCode;
         public DisconnectReason DisconnectReason;
@@ -76,18 +78,56 @@ namespace LiteNetLib
     /// <summary>
     /// Main class for all network operations. Can be used as client and/or server.
     /// </summary>
-    public class NetManager : INetSocketListener, IConnectionRequestListener, IEnumerable<NetPeer>
+    public class NetManager : INetSocketListener, IEnumerable<NetPeer>
     {
         private class IPEndPointComparer : IEqualityComparer<IPEndPoint>
         {
             public bool Equals(IPEndPoint x, IPEndPoint y)
             {
-                return x.Equals(y);
+                return x.Address.Equals(y.Address) && x.Port == y.Port;
             }
 
             public int GetHashCode(IPEndPoint obj)
             {
                 return obj.GetHashCode();
+            }
+        }
+
+        public struct NetPeerEnumerator : IEnumerator<NetPeer>
+        {
+            private readonly NetPeer _initialPeer;
+            private NetPeer _p;
+
+            public NetPeerEnumerator(NetPeer p)
+            {
+                _initialPeer = p;
+                _p = null;
+            }
+
+            public void Dispose()
+            {
+
+            }
+
+            public bool MoveNext()
+            {
+                _p = _p == null ? _initialPeer : _p.NextPeer;
+                return _p != null;
+            }
+
+            public void Reset()
+            {
+                throw new NotSupportedException();
+            }
+
+            public NetPeer Current
+            {
+                get { return _p; }
+            }
+
+            object IEnumerator.Current
+            {
+                get { return _p; }
             }
         }
 
@@ -109,6 +149,7 @@ namespace LiteNetLib
         private readonly Queue<NetEvent> _netEventsQueue;
         private readonly Stack<NetEvent> _netEventsPool;
         private readonly INetEventListener _netEventListener;
+        private readonly IDeliveryEventListener _deliveryEventListener;
 
         private readonly Dictionary<IPEndPoint, NetPeer> _peersDict;
         private readonly ReaderWriterLockSlim _peersLock;
@@ -177,6 +218,11 @@ namespace LiteNetLib
         /// Experimental feature. Events automatically will be called without PollEvents method from another thread
         /// </summary>
         public bool UnsyncedEvents = false;
+
+        /// <summary>
+        /// If true - delivery event will be called from "receive" thread otherwise on PollEvents call
+        /// </summary>
+        public bool UnsyncedDeliveryEvent = false;
 
         /// <summary>
         /// Allows receive broadcast packets
@@ -281,19 +327,8 @@ namespace LiteNetLib
             return result;
         }
 
-        private NetPeer TryAddPeer(NetPeer peer)
+        private void AddPeer(NetPeer peer)
         {
-            _peersLock.EnterUpgradeableReadLock();
-            NetPeer existingPeer;
-            if (_peersDict.TryGetValue(peer.EndPoint, out existingPeer))
-            {
-                //return back unused peerId
-                lock (_peerIds)
-                    _peerIds.Enqueue(peer.Id);
-
-                _peersLock.ExitUpgradeableReadLock();
-                return existingPeer;
-            }
             _peersLock.EnterWriteLock();
             if (_headPeer != null)
             {
@@ -303,8 +338,6 @@ namespace LiteNetLib
             _headPeer = peer;
             _peersDict.Add(peer.EndPoint, peer);
             _peersLock.ExitWriteLock();
-            _peersLock.ExitUpgradeableReadLock();
-            return peer;
         }
 
         private void RemovePeer(NetPeer peer)
@@ -320,24 +353,26 @@ namespace LiteNetLib
                 return;
             if (peer == _headPeer)
                 _headPeer = peer.NextPeer;
+
             if (peer.PrevPeer != null)
                 peer.PrevPeer.NextPeer = peer.NextPeer;
             if (peer.NextPeer != null)
                 peer.NextPeer.PrevPeer = peer.PrevPeer;
             peer.PrevPeer = null;
-            peer.NextPeer = null;
-            lock(_peerIds)
+
+            lock (_peerIds)
                 _peerIds.Enqueue(peer.Id);
         }
 
         /// <summary>
         /// NetManager constructor
         /// </summary>
-        /// <param name="listener">Network events listener</param>
+        /// <param name="listener">Network events listener (also can implement IDeliveryEventListener)</param>
         public NetManager(INetEventListener listener)
         {
             _socket = new NetSocket(this);
             _netEventListener = listener;
+            _deliveryEventListener = listener as IDeliveryEventListener;
             _netEventsQueue = new Queue<NetEvent>();
             _netEventsPool = new Stack<NetEvent>();
             NetPacketPool = new NetPacketPool();
@@ -352,6 +387,12 @@ namespace LiteNetLib
         internal void ConnectionLatencyUpdated(NetPeer fromPeer, int latency)
         {
             CreateEvent(NetEvent.EType.ConnectionLatencyUpdated, fromPeer, latency: latency);
+        }
+
+        internal void MessageDelivered(NetPeer fromPeer, object userData)
+        {
+            if(_deliveryEventListener != null)
+                CreateEvent(NetEvent.EType.MessageDelivered, fromPeer, userData: userData);
         }
 
         internal int SendRawAndRecycle(NetPacket packet, IPEndPoint remoteEndPoint)
@@ -382,6 +423,11 @@ namespace LiteNetLib
                 case SocketError.HostUnreachable:
                     if (TryGetPeer(remoteEndPoint, out fromPeer))
                         DisconnectPeerForce(fromPeer, DisconnectReason.HostUnreachable, errorCode, null);
+                    CreateEvent(NetEvent.EType.Error, remoteEndPoint: remoteEndPoint, errorCode: errorCode);
+                    return -1;
+                case SocketError.NetworkUnreachable:
+                    if (TryGetPeer(remoteEndPoint, out fromPeer))
+                        DisconnectPeerForce(fromPeer, DisconnectReason.NetworkUnreachable, errorCode, null);
                     CreateEvent(NetEvent.EType.Error, remoteEndPoint: remoteEndPoint, errorCode: errorCode);
                     return -1;
                 case SocketError.ConnectionReset: //connection reset (connection closed)
@@ -438,11 +484,17 @@ namespace LiteNetLib
             DisconnectReason disconnectReason = DisconnectReason.ConnectionFailed,
             ConnectionRequest connectionRequest = null,
             DeliveryMethod deliveryMethod = DeliveryMethod.Unreliable,
-            NetPacket readerSource = null)
+            NetPacket readerSource = null,
+            object userData = null)
         {
             NetEvent evt = null;
+            bool unsyncEvent = UnsyncedEvents;
+            
             if (type == NetEvent.EType.Connect)
                 _connectedPeersCount++;
+            else if (type == NetEvent.EType.MessageDelivered)
+                unsyncEvent = UnsyncedDeliveryEvent;
+
             lock (_netEventsPool)
             {
                 if (_netEventsPool.Count > 0)
@@ -459,7 +511,9 @@ namespace LiteNetLib
             evt.DisconnectReason = disconnectReason;
             evt.ConnectionRequest = connectionRequest;
             evt.DeliveryMethod = deliveryMethod;
-            if (UnsyncedEvents)
+            evt.UserData = userData;
+
+            if (unsyncEvent)
             {
                 ProcessEvent(evt);
             }
@@ -505,6 +559,9 @@ namespace LiteNetLib
                     break;
                 case NetEvent.EType.ConnectionRequest:
                     _netEventListener.OnConnectionRequest(evt.ConnectionRequest);
+                    break;
+                case NetEvent.EType.MessageDelivered:
+                    _deliveryEventListener.OnMessageDelivered(evt.Peer, evt.UserData);
                     break;
             }
             //Recycle if not message
@@ -641,12 +698,17 @@ namespace LiteNetLib
             }
         }
 
-        void IConnectionRequestListener.OnConnectionSolved(ConnectionRequest request, byte[] rejectData, int start, int length)
+        internal void OnConnectionSolved(ConnectionRequest request, byte[] rejectData, int start, int length)
         {
             if (request.Result == ConnectionRequestResult.Reject)
             {
                 NetDebug.Write(NetLogLevel.Trace, "[NM] Peer connect reject.");
-                request.Peer.Reject(request.ConnectionId, request.ConnectionNumber, rejectData, start, length);
+                request.Peer.Reject(request.ConnectionId, request.ConnectionNumber, rejectData, start, length, false);
+            }
+            else if (request.Result == ConnectionRequestResult.RejectForce)
+            {
+                NetDebug.Write(NetLogLevel.Trace, "[NM] Peer connect reject force.");
+                request.Peer.Reject(request.ConnectionId, request.ConnectionNumber, rejectData, start, length, true);
             }
             else
             {
@@ -681,8 +743,13 @@ namespace LiteNetLib
             //if we have peer
             if (netPeer != null)
             {
-                NetDebug.Write("ConnectRequest LastId: {0}, NewId: {1}, EP: {2}", netPeer.ConnectTime, connRequest.ConnectionTime, remoteEndPoint);
                 var processResult = netPeer.ProcessConnectRequest(connRequest);
+                NetDebug.Write("ConnectRequest LastId: {0}, NewId: {1}, EP: {2}, Result: {3}", 
+                    netPeer.ConnectTime, 
+                    connRequest.ConnectionTime, 
+                    remoteEndPoint,
+                    processResult);
+
                 switch (processResult)
                 {
                     case ConnectRequestResult.Reconnection:
@@ -722,16 +789,14 @@ namespace LiteNetLib
             //Add new peer and craete ConnectRequest event
             NetDebug.Write("[NM] Creating request event: " + connRequest.ConnectionTime);
             netPeer = new NetPeer(this, remoteEndPoint, GetNextPeerId());
-            if (TryAddPeer(netPeer) == netPeer)
-            {
-                CreateEvent(NetEvent.EType.ConnectionRequest, connectionRequest: new ConnectionRequest(
-                    connRequest.ConnectionTime,
-                    connectionNumber,
-                    ConnectionRequestType.Incoming,
-                    connRequest.Data,
-                    netPeer,
-                    this));
-            }
+            AddPeer(netPeer);
+            CreateEvent(NetEvent.EType.ConnectionRequest, connectionRequest: new ConnectionRequest(
+                connRequest.ConnectionTime,
+                connectionNumber,
+                ConnectionRequestType.Incoming,
+                connRequest.Data,
+                netPeer,
+                this));
         }
 
         private void DataReceived(byte[] reusableBuffer, int count, IPEndPoint remoteEndPoint)
@@ -749,13 +814,33 @@ namespace LiteNetLib
                 return;
             }
 
-            //get peer
-            //Check normal packets
             NetPeer netPeer;
-            //old packets protection
-            bool peerFound = TryGetPeer(remoteEndPoint, out netPeer);
 
-            //Check unconnected
+            //special case connect request
+            if (packet.Property == PacketProperty.ConnectRequest)
+            {
+                if (NetConnectRequestPacket.GetProtocolId(packet) != NetConstants.ProtocolId)
+                {
+                    SendRawAndRecycle(NetPacketPool.GetWithProperty(PacketProperty.InvalidProtocol, 0), remoteEndPoint);
+                    return;
+                }
+                var connRequest = NetConnectRequestPacket.FromData(packet);
+                if (connRequest != null)
+                {
+                    _peersLock.EnterUpgradeableReadLock();
+                    _peersDict.TryGetValue(remoteEndPoint, out netPeer);
+                    //here new peer can be created
+                    ProcessConnectRequest(remoteEndPoint, netPeer, connRequest);
+                    _peersLock.ExitUpgradeableReadLock();
+                }
+                return;
+            }
+
+            _peersLock.EnterReadLock();
+            bool peerFound = _peersDict.TryGetValue(remoteEndPoint, out netPeer);
+            _peersLock.ExitReadLock();
+
+            //Check normal packets
             switch (packet.Property)
             {
                 case PacketProperty.PeerNotFound:
@@ -837,16 +922,6 @@ namespace LiteNetLib
                     if (connAccept != null && peerFound && netPeer.ProcessConnectAccept(connAccept))
                         CreateEvent(NetEvent.EType.Connect, netPeer);
                     break;
-                case PacketProperty.ConnectRequest:
-                    if (NetConnectRequestPacket.GetProtocolId(packet) != NetConstants.ProtocolId)
-                    {
-                        SendRawAndRecycle(NetPacketPool.GetWithProperty(PacketProperty.InvalidProtocol, 0), remoteEndPoint);
-                        break;
-                    }
-                    var connRequest = NetConnectRequestPacket.FromData(packet);
-                    if (connRequest != null)
-                        ProcessConnectRequest(remoteEndPoint, netPeer, connRequest);
-                    break;
                 default:
                     if(peerFound)
                         netPeer.ProcessPacket(packet);
@@ -856,23 +931,11 @@ namespace LiteNetLib
             }
         }
 
-        internal void ReceiveFromPeer(NetPacket packet, IPEndPoint remoteEndPoint)
+        internal void ReceiveFromPeer(NetPacket packet, NetPeer fromPeer)
         {
-            NetPeer fromPeer;
-            if (!TryGetPeer(remoteEndPoint, out fromPeer))
-                return;
-
-            NetDebug.Write(NetLogLevel.Trace, "[NM] Received message");
-            DeliveryMethod deliveryMethod;
-            switch (packet.Property)
-            {
-                default: //PacketProperty.Unreliable
-                    deliveryMethod = DeliveryMethod.Unreliable;
-                    break;
-                case PacketProperty.Channeled:
-                    deliveryMethod = NetConstants.ChannelIdToDeliveryMethod(packet.ChannelId, _channelsCount);
-                    break;
-            }
+            var deliveryMethod = packet.Property == PacketProperty.Channeled
+                ? (DeliveryMethod) (packet.ChannelId % 4)
+                : DeliveryMethod.Unreliable;
             CreateEvent(NetEvent.EType.Receive, fromPeer, deliveryMethod: deliveryMethod, readerSource: packet);
         }
 
@@ -1221,7 +1284,9 @@ namespace LiteNetLib
 
             NetPeer peer;
             byte connectionNumber = 0;
-            if (TryGetPeer(target, out peer))
+
+            _peersLock.EnterUpgradeableReadLock();
+            if (_peersDict.TryGetValue(target, out peer))
             {
                 switch (peer.ConnectionState)
                 {
@@ -1229,15 +1294,21 @@ namespace LiteNetLib
                     case ConnectionState.Connected:
                     case ConnectionState.Outcoming:
                     case ConnectionState.Incoming:
+                        _peersLock.ExitUpgradeableReadLock();
                         return peer;
                 }
                 //else reconnect
                 connectionNumber = (byte)((peer.ConnectionNum + 1) % NetConstants.MaxConnectionNumber);
                 RemovePeer(peer);
             }
+
             //Create reliable connection
             //And send connection request
-            return TryAddPeer(new NetPeer(this, target, GetNextPeerId(), connectionNumber, connectionData));
+            peer = new NetPeer(this, target, GetNextPeerId(), connectionNumber, connectionData);
+            AddPeer(peer);
+            _peersLock.ExitUpgradeableReadLock();
+
+            return peer;
         }
 
         /// <summary>
@@ -1425,19 +1496,19 @@ namespace LiteNetLib
                 null);
         }
 
-        public IEnumerator<NetPeer> GetEnumerator()
+        public NetPeerEnumerator GetEnumerator()
         {
-            var peer = _headPeer;
-            while (peer != null)
-            {
-                yield return peer;
-                peer = peer.NextPeer;
-            }
+            return new NetPeerEnumerator(_headPeer);
+        }
+
+        IEnumerator<NetPeer> IEnumerable<NetPeer>.GetEnumerator()
+        {
+            return new NetPeerEnumerator(_headPeer);
         }
 
         IEnumerator IEnumerable.GetEnumerator()
         {
-            return GetEnumerator();
+            return new NetPeerEnumerator(_headPeer);
         }
     }
 }

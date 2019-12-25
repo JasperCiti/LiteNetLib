@@ -31,7 +31,7 @@ namespace LiteNetLib.Tests
 
         public NetManagerStack ManagerStack { get; set; }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
         public void ConnectionByIpV4()
         {
             var server = ManagerStack.Server(1);
@@ -48,7 +48,44 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(1, client.PeersCount);
         }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
+        public void DeliveryTest()
+        {
+            var server = ManagerStack.Server(1);
+            var client = ManagerStack.Client(1);
+            bool msgDelivered = false;
+            bool msgReceived = false;
+
+            ManagerStack.ClientListener(1).DeliveryEvent += (peer, obj) =>
+            {
+                Assert.AreEqual(5, (int)obj);
+                msgDelivered = true;
+            };
+            ManagerStack.ClientListener(1).PeerConnectedEvent += peer =>
+            {
+                int testData = 5;
+                peer.SendWithDeliveryEvent(new byte[12500], 0, DeliveryMethod.ReliableUnordered, testData);
+            };
+            ManagerStack.ServerListener(1).NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                Assert.AreEqual(12500, reader.UserDataSize);
+                msgReceived = true;
+            };
+
+            client.Connect("127.0.0.1", DefaultPort, DefaultAppKey);
+
+            while (server.PeersCount != 1 || client.PeersCount != 1 || !msgDelivered || !msgReceived)
+            {
+                Thread.Sleep(15);
+                server.PollEvents();
+                client.PollEvents();
+            }
+
+            Assert.AreEqual(1, server.PeersCount);
+            Assert.AreEqual(1, client.PeersCount);
+        }
+
+        [Test, Timeout(2000)]
         public void PeerNotFoundTest()
         {
             var server = ManagerStack.Server(1);
@@ -76,7 +113,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(DisconnectReason.RemoteConnectionClose, disconnectInfo.Value.Reason);
         }
 
-        [Test, MaxTime(10000)]
+        [Test, Timeout(10000)]
         public void ConnectionFailedTest()
         {
             NetManager client = ManagerStack.Client(1);
@@ -106,7 +143,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(DisconnectReason.ConnectionFailed, disconnectInfo.Reason);
         }
 
-        [Test, MaxTime(10000)]
+        [Test, Timeout(10000)]
         public void NetPeerDisconnectTimeout()
         {
             NetManager client = ManagerStack.Client(1);
@@ -215,7 +252,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(0, client.PeersCount);
         }
 
-        [Test, MaxTime(10000)]
+        [Test, Timeout(10000)]
         public void NetPeerDisconnectAll()
         {
             NetManager client = ManagerStack.Client(1);
@@ -262,7 +299,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(ConnectionState.Disconnected, clientServerPeer.ConnectionState);
         }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
         public void DisconnectFromServerTest()
         {
             NetManager server = ManagerStack.Server(1);
@@ -297,7 +334,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(0, client.PeersCount);
         }
 
-        [Test, MaxTime(5000)]
+        [Test, Timeout(5000)]
         public void ConnectAfterDisconnectWithSamePort()
         {
             NetManager server = ManagerStack.Server(1);
@@ -333,7 +370,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(1, client.PeersCount);
         }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
         public void DisconnectFromClientTest()
         {
             NetManager server = ManagerStack.Server(1);
@@ -370,7 +407,54 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(0, client.PeersCount);
         }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
+        public void ChannelsTest()
+        {
+            const int channelsCount = 64;
+            var server = ManagerStack.Server(1);
+            var client = ManagerStack.Client(1);
+            server.ChannelsCount = channelsCount;
+            client.ChannelsCount = channelsCount;
+            int messagesReceived = 0;
+            ManagerStack.ServerListener(1).NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                Assert.AreEqual((DeliveryMethod)reader.GetByte(), method);
+                messagesReceived++;
+            };
+            client.Connect("127.0.0.1", DefaultPort, DefaultAppKey);
+            NetDataWriter writer = new NetDataWriter();
+            var methods = new[]
+            {
+                DeliveryMethod.Unreliable,
+                DeliveryMethod.Sequenced,
+                DeliveryMethod.ReliableOrdered,
+                DeliveryMethod.ReliableSequenced,
+                DeliveryMethod.ReliableUnordered
+            };
+            for (int i = 0; i < channelsCount; i++)
+            {
+                foreach (var deliveryMethod in methods)
+                {
+                    writer.Reset();
+                    writer.Put((byte)deliveryMethod);
+                    if(deliveryMethod == DeliveryMethod.ReliableOrdered || deliveryMethod == DeliveryMethod.ReliableUnordered)
+                        writer.Put(new byte[506]);
+                    client.FirstPeer.Send(writer, (byte)i, deliveryMethod);
+                }
+            }
+
+            while (messagesReceived != methods.Length*channelsCount)
+            {
+                Thread.Sleep(15);
+                server.PollEvents();
+            }
+
+            Assert.AreEqual(methods.Length*channelsCount, messagesReceived);
+            Assert.AreEqual(1, server.PeersCount);
+            Assert.AreEqual(1, client.PeersCount);
+        }
+
+        [Test, Timeout(2000)]
         public void ConnectionByIpV6()
         {
             var server = ManagerStack.Server(1);
@@ -387,7 +471,7 @@ namespace LiteNetLib.Tests
             Assert.AreEqual(1, client.PeersCount);
         }
 
-        [Test, MaxTime(2000)]
+        [Test, Timeout(2000)]
         public void DiscoveryBroadcastTest()
         {
             var server = ManagerStack.Server(1);
